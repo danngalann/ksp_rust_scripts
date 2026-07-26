@@ -8,3 +8,58 @@ This is a learning project. Its programs will cover activities such as launches,
 - kRPC and KSP flight control
 - Rocket flight and orbital mechanics
 - The mathematics behind the maneuvers
+
+## Project structure
+
+- `src/lib.rs`: the `KspClient` library, where low-level kRPC calls are turned into focused rocket operations.
+- `src/bin/vessel_info.rs`: a runnable connection test that prints basic data for KSP's active vessel.
+- `services/`: the `KRPC.SpaceCenter.json` API description copied from the installed kRPC mod.
+- `build.rs`: generates Rust bindings from the service descriptions during every relevant Cargo build.
+
+The JSON files are kRPC's machine-readable API descriptions, not save data or a configuration to edit by hand. `krpc-mars-terraformer` is a Rust build dependency, unrelated to HashiCorp Terraform: it reads those JSON descriptions and writes the generated `src/services/` bindings. The generated files are ignored by Git because Cargo can recreate them. The installed `KRPC.Core.json` uses a newer `BYTES` type that the current generator does not support; it is not needed because `krpc-mars` implements the connection protocol itself.
+
+`vendor/krpc-mars-terraformer/` is a local GPL-3.0 copy of the upstream generator. It changes its enum-value parser from `u32` to `i32`, allowing current kRPC's legitimate negative bit-flag value, `MapFilterType::All = -1`. It also retains original RPC procedure names while assigning `_overload` suffixes to Rust method names that would otherwise collide after conversion to `snake_case`. Keep this patch until an upstream release supports both the current kRPC schemas and this project can return to the Git dependency.
+
+## Prerequisites
+
+- Rust and Cargo. Verify with `cargo --version`.
+- Protocol Buffers' `protoc` compiler, required by the upstream `krpc-mars` crate. Install it from an elevated PowerShell or Command Prompt:
+
+  ```powershell
+  winget install --exact --id Google.Protobuf --accept-package-agreements --accept-source-agreements
+  ```
+
+  Restart VS Code after installation, then verify it with `protoc --version`.
+- Kerbal Space Program with the kRPC mod installed.
+- The local kRPC RPC server running at `127.0.0.1:50000`.
+
+This project was set up against the kRPC installation at `S:\GAMES\SteamLibrary\steamapps\common\Kerbal Space Program`. Its `settings.cfg` enables automatic server startup and connection acceptance, with the default RPC port `50000`.
+
+## Build and run
+
+1. Start KSP and load a save into the Flight scene with a vessel selected. Wait for the kRPC server to start.
+2. In this repository, compile the project:
+
+	```powershell
+	cargo build
+	```
+
+3. Run the connection test:
+
+	```powershell
+	cargo run --bin vessel_info
+	```
+
+Expected output includes the active vessel name, type, situation, mass in kilograms, and mission elapsed time in seconds. A connection-refused error means KSP/kRPC is not running or its RPC port differs from `50000`.
+
+Run the checks with:
+
+```powershell
+cargo test
+```
+
+Cargo is Rust's equivalent of npm plus its build/test runner: it downloads dependencies, runs `build.rs` to generate the bindings, compiles the crate, and runs the requested command. The first build may take longer while Cargo downloads and compiles the two `krpc-mars` Git dependencies.
+
+## Contribution and learning approach
+
+Code and documentation should favor clarity over cleverness. Changes should explain unfamiliar Rust, Cargo, mathematical, and orbital-mechanics concepts in context, including relevant assumptions and units. See [.github/copilot-instructions.md](.github/copilot-instructions.md) for the repository guidance used by AI agents.

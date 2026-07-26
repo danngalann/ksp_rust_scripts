@@ -1,0 +1,12 @@
+[package]
+name = "ksp_krpc"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+krpc-mars = { git = "https://github.com/Cahu/krpc-mars" }
+
+[build-dependencies]
+glob = "0.3"
+krpc-mars-terraformer = { path = "vendor/krpc-mars-terraformer" }

@@ -26,6 +26,7 @@ Treat learning as a product requirement, not an afterthought.
 - Inspect the existing layout and documentation before adding or changing implementation conventions. This repository is intentionally being established in stages; do not assume a Cargo workspace, package name, crate structure, test command, or KSP connection configuration exists until it is added.
 - Keep each change focused and validate it with the narrowest relevant command available. Once Cargo tooling exists, use the commands documented in the README and/or this file rather than guessing.
 - Use `git` to inspect status, history, and diffs, and use `gh` for GitHub repository, issue, pull-request, and workflow tasks when appropriate. Do not discard user changes or rewrite history unless explicitly requested.
+- When the user requests commits, create small commits with short imperative subjects, grouping files together only when they form a coherent change, and always push each commit after creating it.
 - Tools supplied in the agent context are available in addition to the tools named here. Use the most suitable available tool, and document stable, project-specific tools below when they are introduced.
 
 ## Keep project guidance current
@@ -37,9 +38,10 @@ Treat learning as a product requirement, not an afterthought.
 
 ## Current repository facts
 
-- The repository is newly initialized and currently has no Rust project, automation, tests, or project-specific build commands.
-- Planned language: Rust.
-- Planned integration: kRPC for Kerbal Space Program.
-- Project-specific tools: none documented yet.
+- The root Cargo package is `ksp_krpc`, a Rust library that wraps kRPC operations and executable examples in `src/bin/`.
+- The `services/KRPC.SpaceCenter.json` definition is stored in `services/`. `build.rs` generates ignored Rust bindings in `src/services/` using the patched local `vendor/krpc-mars-terraformer/`. Do not add the installed `KRPC.Core.json`: its `BYTES` type is unsupported by the current generator and is unnecessary for the library's connection protocol. The vendored generator changes `EnumValue.value` from `u32` to `i32` so current kRPC's `MapFilterType::All = -1` parses correctly, and keeps original RPC procedure names while adding `_overload` only where Rust `snake_case` names collide. Preserve its GPL-3.0 license and replace the patch only after verifying an upstream-compatible release.
+- `cargo build` generates bindings and compiles the project. It requires the `protoc` compiler because the upstream `krpc-mars` crate builds Protocol Buffers code. `cargo test` runs the project's checks. `cargo run --bin vessel_info` connects to a running local KSP/kRPC instance and prints the active vessel's basic telemetry.
+- The local KSP installation is `S:\GAMES\SteamLibrary\steamapps\common\Kerbal Space Program`; its kRPC configuration currently uses `127.0.0.1:50000` for RPC and `127.0.0.1:50001` for streaming.
+- Project-specific tools: Cargo/Rust, Protocol Buffers (`protoc`), kRPC, `krpc-mars`, and `krpc-mars-terraformer`.
 
-When project tooling is added, replace the relevant statements above with verified setup, build, test, lint, run, and simulation/connection instructions.
+Keep these facts in sync with verified Cargo commands, crate dependencies, generated-code conventions, and kRPC connection settings.

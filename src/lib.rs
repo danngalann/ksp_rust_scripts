@@ -620,8 +620,8 @@ mod tests {
         let duration = burn_duration_s(50.0, 300.0, 5_000.0, 500.0);
 
         // Mass flow rate = thrust / (Isp * g0) ~= 1.698 kg/s.
-        // Burned mass = 500 * (1 - e^(-50 / (300 * g0))) ~= 28.36 kg.
-        // Expected duration ~= 16.7 s.
-        assert!((duration - 16.7).abs() < 0.1);
+        // Burned mass = 500 * (1 - e^(-50 / (300 * g0))) ~= 8.43 kg.
+        // Expected duration ~= 5.0 s.
+        assert!((duration - 5.0).abs() < 0.1);
     }
 }

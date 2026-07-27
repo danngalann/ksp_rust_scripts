@@ -5,6 +5,7 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
 krpc-mars = { git = "https://github.com/Cahu/krpc-mars" }
 
 [build-dependencies]

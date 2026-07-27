@@ -152,6 +152,10 @@ function Write-ServiceReference(
         $lines.Add('')
     }
 
+    while ($lines.Count -gt 0 -and [string]::IsNullOrEmpty($lines[$lines.Count - 1])) {
+        $lines.RemoveAt($lines.Count - 1)
+    }
+
     $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllLines($Path, $lines, $utf8WithoutBom)
 }

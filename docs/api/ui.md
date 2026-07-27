@@ -178,4 +178,3 @@ Text alignment.
 | `UpperCenter` | 6 |
 | `UpperLeft` | 7 |
 | `UpperRight` | 8 |
-

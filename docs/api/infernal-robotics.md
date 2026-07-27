@@ -125,4 +125,3 @@ The mode a servo is operating in. See .
 | --- | --- |
 | `Servo` | 1 |
 | `Rotor` | 2 |
-

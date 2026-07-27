@@ -96,4 +96,3 @@ The type of an alarm.
 | `Transfer` | 16 |
 | `TransferModelled` | 17 |
 | `ScienceLab` | 18 |
-

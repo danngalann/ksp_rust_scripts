@@ -97,4 +97,3 @@ Text. Created using .
 | `Text_static_AvailableFonts` | None | `List<STRING>` | FLIGHT | A list of all available fonts. |
 
 ## Enumerations
-

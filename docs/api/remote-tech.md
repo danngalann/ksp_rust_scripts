@@ -61,4 +61,3 @@ The type of object an antenna is targetting. See .
 | `GroundStation` | 2 |
 | `Vessel` | 3 |
 | `None` | 4 |
-

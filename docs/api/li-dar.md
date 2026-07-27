@@ -23,4 +23,3 @@ A LaserDist laser.
 | `Laser_get_Part` | None | `Part` | Any | Get the part containing this LiDAR. |
 
 ## Enumerations
-

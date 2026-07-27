@@ -24,6 +24,8 @@ Treat learning as a product requirement, not an afterthought.
 ## Working in this repository
 
 - Inspect the existing layout and documentation before adding or changing implementation conventions. This repository is intentionally being established in stages; do not assume a Cargo workspace, package name, crate structure, test command, or KSP connection configuration exists until it is added.
+- Begin kRPC API work with [`docs/README.md`](../docs/README.md). Read its focused Rust-client, generated API, and official-tutorial guides before searching generated bindings. The local service references are generated from `services/KRPC.*.json`; use them to locate calls instead of grepping `src/services/`.
+- The current generated Rust surface includes SpaceCenter, UI, Drawing, InfernalRobotics, KerbalAlarmClock, LiDAR, and RemoteTech. Look up the local reference before using a service. Do not add `KRPC.Core.json` or `KRPC.DockingCamera.json`: their `BYTES` type remains unsupported, and the project intentionally defers support because `krpc-mars` already handles connection setup and normal streams without Core bindings. Revisit that decision only for Core's advanced control-plane APIs or the optional DockingCamera image buffer.
 - Keep each change focused and validate it with the narrowest relevant command available. Once Cargo tooling exists, use the commands documented in the README and/or this file rather than guessing.
 - Use `git` to inspect status, history, and diffs, and use `gh` for GitHub repository, issue, pull-request, and workflow tasks when appropriate. Do not discard user changes or rewrite history unless explicitly requested.
 - When the user requests commits, create small commits with short imperative subjects, grouping files together only when they form a coherent change, and always push each commit after creating it.
@@ -43,5 +45,6 @@ Treat learning as a product requirement, not an afterthought.
 - `cargo build` generates bindings and compiles the project. It requires the `protoc` compiler because the upstream `krpc-mars` crate builds Protocol Buffers code. `cargo test` runs the project's checks. `cargo run --bin vessel_info` connects to a running local KSP/kRPC instance and prints the active vessel's basic telemetry.
 - The local KSP installation is `S:\GAMES\SteamLibrary\steamapps\common\Kerbal Space Program`; its kRPC configuration currently uses `127.0.0.1:50000` for RPC and `127.0.0.1:50001` for streaming.
 - Project-specific tools: Cargo/Rust, Protocol Buffers (`protoc`), kRPC, `krpc-mars`, and `krpc-mars-terraformer`.
+- When any compatible `services/KRPC.*.json` changes, run `cargo build` and `powershell -ExecutionPolicy Bypass -File docs\generate-api-references.ps1`, then commit the refreshed `docs/api/` references.
 
 Keep these facts in sync with verified Cargo commands, crate dependencies, generated-code conventions, and kRPC connection settings.

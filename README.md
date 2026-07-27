@@ -13,10 +13,11 @@ This is a learning project. Its programs will cover activities such as launches,
 
 - `src/lib.rs`: the `KspClient` library, where low-level kRPC calls are turned into focused rocket operations.
 - `src/bin/vessel_info.rs`: a runnable connection test that prints basic data for KSP's active vessel.
-- `services/`: the `KRPC.SpaceCenter.json` API description copied from the installed kRPC mod.
+- `services/`: compatible `KRPC.*.json` API descriptions copied from the installed kRPC mod, including SpaceCenter, UI, Drawing, and installed mod integrations.
 - `build.rs`: generates Rust bindings from the service descriptions during every relevant Cargo build.
+- `docs/`: generated per-service API references and focused Rust/kRPC guides for contributors and agents.
 
-The JSON files are kRPC's machine-readable API descriptions, not save data or a configuration to edit by hand. `krpc-mars-terraformer` is a Rust build dependency, unrelated to HashiCorp Terraform: it reads those JSON descriptions and writes the generated `src/services/` bindings. The generated files are ignored by Git because Cargo can recreate them. The installed `KRPC.Core.json` uses a newer `BYTES` type that the current generator does not support; it is not needed because `krpc-mars` implements the connection protocol itself.
+The JSON files are kRPC's machine-readable API descriptions, not save data or a configuration to edit by hand. `krpc-mars-terraformer` is a Rust build dependency, unrelated to HashiCorp Terraform: it reads those JSON descriptions and writes the generated `src/services/` bindings. The generated files are ignored by Git because Cargo can recreate them. The installed `KRPC.Core.json` and `KRPC.DockingCamera.json` use a `BYTES` type that the current generator does not support; Core is not needed because `krpc-mars` implements the connection protocol itself. After changing a compatible service schema, run `cargo build` and `powershell -ExecutionPolicy Bypass -File docs\generate-api-references.ps1` to refresh its generated API reference.
 
 `vendor/krpc-mars-terraformer/` is a local GPL-3.0 copy of the upstream generator. It changes its enum-value parser from `u32` to `i32`, allowing current kRPC's legitimate negative bit-flag value, `MapFilterType::All = -1`. It also retains original RPC procedure names while assigning `_overload` suffixes to Rust method names that would otherwise collide after conversion to `snake_case`. Keep this patch until an upstream release supports both the current kRPC schemas and this project can return to the Git dependency.
 

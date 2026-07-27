@@ -1,7 +1,7 @@
 use std::fs;
 
 fn main() {
-    let service_paths: Vec<_> = glob::glob("services/KRPC.SpaceCenter.json")
+    let service_paths: Vec<_> = glob::glob("services/KRPC.*.json")
         .expect("the kRPC service schema pattern must be valid")
         .filter_map(Result::ok)
         .collect();

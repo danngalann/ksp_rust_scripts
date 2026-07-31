@@ -37,6 +37,14 @@ pub struct VesselInfo {
     pub mission_elapsed_time_s: f64,
 }
 
+/// The launch body's name and atmosphere height above mean sea level.
+#[derive(Debug, Clone)]
+pub struct BodyInfo {
+    pub name: String,
+    /// Zero for an airless body; otherwise the atmosphere depth in meters.
+    pub atmosphere_depth_m: f64,
+}
+
 /// A connection to the kRPC server that backs higher-level rocket operations.
 pub struct KspClient {
     rpc: krpc_mars::RPCClient,
@@ -79,22 +87,28 @@ impl KspClient {
         })
     }
 
-    /// Engage the autopilot pointing straight up, throttle up, and stage until
-    /// the engines are actually producing thrust.
+    /// Read the body currently orbited by the active vessel.
+    pub fn current_body_info(&mut self) -> Result<BodyInfo, Box<dyn Error>> {
+        let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
+        let orbit = self.rpc.mk_call(&vessel.get_orbit())?;
+        let body = self.rpc.mk_call(&orbit.get_body())?;
+        let (name, atmosphere_depth_m) = krpc_mars::batch_call!(
+            &mut self.rpc,
+            (&body.get_name(), &body.get_atmosphere_depth())
+        )?;
+
+        Ok(BodyInfo {
+            name: name?,
+            atmosphere_depth_m: atmosphere_depth_m?,
+        })
+    }
+
+    /// Engage the autopilot pointing straight up and set launch throttle.
     ///
-    /// A single `activate_next_stage()` call isn't always enough: some craft
-    /// have a decoupler, fairing, or launch-clamp-only stage sitting above the
-    /// stage that actually ignites the engines, so thrust can still read zero
-    /// right after staging once. But re-staging isn't always the right fix
-    /// either: kRPC's own docs on `Control.throttle` note that reading it back
-    /// right after a set can still return the previous value for one physics
-    /// tick, and a revert-to-launch can also leave the throttle reset from a
-    /// previous attempt. If the throttle itself is zero, no engine will ever
-    /// show thrust no matter how many stages get activated, so check and fix
-    /// that first - staging again in that situation would activate whatever
-    /// comes after the engine in the sequence (e.g. a decoupler) before the
-    /// engine ever got a real chance to run.
-    pub fn begin_vertical_ascent(&mut self, throttle: f32) -> Result<(), Box<dyn Error>> {
+    /// Staging is deliberately separate. Mission code must use an explicit
+    /// [`PropulsionStagePlan`] so a failed ignition cannot repeatedly advance
+    /// through unrelated decoupler, fairing, payload, or recovery stages.
+    pub fn prepare_vertical_ascent(&mut self, throttle: f32) -> Result<(), Box<dyn Error>> {
         let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
         let control = self.rpc.mk_call(&vessel.get_control())?;
         let auto_pilot = self.rpc.mk_call(&vessel.get_auto_pilot())?;
@@ -105,26 +119,8 @@ impl KspClient {
         self.rpc.mk_call(&auto_pilot.set_engaged(true))?;
 
         self.rpc.mk_call(&control.set_throttle(throttle))?;
-        self.rpc.mk_call(&control.activate_next_stage())?;
 
-        const MAX_IGNITION_RECOVERY_ATTEMPTS: u32 = 5;
-        const IGNITION_SETTLE_TIME: Duration = Duration::from_millis(500);
-
-        for _ in 0..MAX_IGNITION_RECOVERY_ATTEMPTS {
-            thread::sleep(IGNITION_SETTLE_TIME);
-
-            if self.rpc.mk_call(&vessel.get_available_thrust())? > 0.0 {
-                return Ok(());
-            }
-
-            if self.rpc.mk_call(&control.get_throttle())? <= 0.0 {
-                self.rpc.mk_call(&control.set_throttle(throttle))?;
-            } else {
-                self.rpc.mk_call(&control.activate_next_stage())?;
-            }
-        }
-
-        Err("No stage produced thrust after several activations; check the vessel's staging.".into())
+        Ok(())
     }
 
 
@@ -151,6 +147,15 @@ impl KspClient {
         Ok((vertical_speed_ms, horizontal_speed_ms))
     }
 
+    /// Read aerodynamic dynamic pressure, in pascals.
+    pub fn dynamic_pressure_pa(&mut self) -> Result<f32, Box<dyn Error>> {
+        let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
+        let surface_frame = self.rpc.mk_call(&vessel.get_surface_reference_frame())?;
+        let flight = self.rpc.mk_call(&vessel.flight(surface_frame))?;
+
+        Ok(self.rpc.mk_call(&flight.get_dynamic_pressure())?)
+    }
+
     /// Read the vessel's total currently available thrust, in Newtons.
     pub fn available_thrust_n(&mut self) -> Result<f32, Box<dyn Error>> {
         let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
@@ -168,6 +173,84 @@ impl KspClient {
         Ok(())
     }
 
+    /// KSP's internal stage cursor. The next Space press activates one less.
+    pub fn current_stage(&mut self) -> Result<i32, Box<dyn Error>> {
+        let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
+        let control = self.rpc.mk_call(&vessel.get_control())?;
+
+        Ok(self.rpc.mk_call(&control.get_current_stage())?)
+    }
+
+    /// Maximum engine thrust assigned to the next pending UI stage, in newtons.
+    ///
+    /// `Vessel.stage_at` only exposes stock delta-v activation stages and can
+    /// reject a valid mixed stage, such as engines activated alongside launch
+    /// clamps. KSP's internal `current_stage` is one greater than the stage
+    /// activated by the next Space press, so inspect engine parts assigned to
+    /// `current_stage - 1` and sum `Engine.max_thrust`. Maximum thrust describes
+    /// capacity without requiring inactive fuel-flow state to be initialized.
+    pub fn next_stage_max_thrust_n(&mut self) -> Result<(i32, f32), Box<dyn Error>> {
+        let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
+        let control = self.rpc.mk_call(&vessel.get_control())?;
+        let parts = self.rpc.mk_call(&vessel.get_parts())?;
+        let current_stage = self.rpc.mk_call(&control.get_current_stage())?;
+        let pending_stage = pending_stage_number(current_stage).ok_or(
+            "KSP reports no pending stage; throttle cut without staging.",
+        )?;
+        let engines = self.rpc.mk_call(&parts.get_engines())?;
+        let mut stage_max_thrust_n = 0.0;
+
+        for engine in engines {
+            let part = self.rpc.mk_call(&engine.get_part())?;
+            let (engine_stage, max_thrust_n) = krpc_mars::batch_call!(
+                &mut self.rpc,
+                (&part.get_stage(), &engine.get_max_thrust())
+            )?;
+
+            if engine_stage? == pending_stage {
+                stage_max_thrust_n += max_thrust_n?;
+            }
+        }
+
+        Ok((pending_stage, stage_max_thrust_n))
+    }
+
+    /// Classify active engine state independently from the vessel throttle.
+    pub fn active_propulsion_state(
+        &mut self,
+        min_thrust_n: f32,
+    ) -> Result<ActivePropulsionState, Box<dyn Error>> {
+        let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
+        let parts = self.rpc.mk_call(&vessel.get_parts())?;
+        let engines = self.rpc.mk_call(&parts.get_engines())?;
+        let mut active_engine_found = false;
+
+        for engine in engines {
+            let (active, has_fuel, flameout, available_thrust_n) = krpc_mars::batch_call!(
+                &mut self.rpc,
+                (
+                    &engine.get_active(),
+                    &engine.get_has_fuel(),
+                    &engine.get_flameout(),
+                    &engine.get_available_thrust(),
+                )
+            )?;
+
+            if active? {
+                active_engine_found = true;
+                if has_fuel? && !flameout? && available_thrust_n? >= min_thrust_n {
+                    return Ok(ActivePropulsionState::Usable);
+                }
+            }
+        }
+
+        if active_engine_found {
+            Ok(ActivePropulsionState::Spent)
+        } else {
+            Ok(ActivePropulsionState::NoActiveEngines)
+        }
+    }
+
     /// Set the active vessel's main throttle, from 0.0 through 1.0.
     pub fn set_throttle(&mut self, throttle: f32) -> Result<(), Box<dyn Error>> {
         let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
@@ -181,7 +264,7 @@ impl KspClient {
     /// Command the autopilot toward a pitch (degrees above horizon) and heading (compass degrees).
     ///
     /// Assumes the autopilot is already engaged with a reference frame set, as
-    /// `begin_vertical_ascent` does.
+    /// `prepare_vertical_ascent` does.
     pub fn set_target_pitch_and_heading(&mut self, pitch: f32, heading: f32) -> Result<(), Box<dyn Error>> {
         let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
         let auto_pilot = self.rpc.mk_call(&vessel.get_auto_pilot())?;
@@ -304,6 +387,21 @@ impl KspClient {
         Ok(self.rpc.mk_call(&node.remaining_burn_vector(surface_frame))?)
     }
 
+    /// Signed remaining prograde delta-v in the node's orbital frame, in m/s.
+    ///
+    /// The orbital frame's y-axis is prograde. A circularization node requests
+    /// positive y; crossing through zero therefore identifies an overshoot even
+    /// if the scalar remaining delta-v has begun increasing again.
+    pub fn node_remaining_prograde_ms(
+        &mut self,
+        node: space_center::Node,
+    ) -> Result<f64, Box<dyn Error>> {
+        let orbital_frame = self.rpc.mk_call(&node.get_orbital_reference_frame())?;
+        let (_, prograde_ms, _) = self.rpc.mk_call(&node.remaining_burn_vector(orbital_frame))?;
+
+        Ok(prograde_ms)
+    }
+
     /// Seconds until the maneuver node occurs.
     pub fn node_time_to(&mut self, node: space_center::Node) -> Result<f64, Box<dyn Error>> {
         Ok(self.rpc.mk_call(&node.get_time_to())?)
@@ -315,6 +413,14 @@ impl KspClient {
         let auto_pilot = self.rpc.mk_call(&vessel.get_auto_pilot())?;
 
         Ok(self.rpc.mk_call(&auto_pilot.set_target_direction(direction))?)
+    }
+
+    /// Angular error between the commanded autopilot direction and vessel, in degrees.
+    pub fn autopilot_error_deg(&mut self) -> Result<f32, Box<dyn Error>> {
+        let vessel = self.rpc.mk_call(&space_center::get_active_vessel())?;
+        let auto_pilot = self.rpc.mk_call(&vessel.get_auto_pilot())?;
+
+        Ok(self.rpc.mk_call(&auto_pilot.get_error())?)
     }
 
     /// Remove a maneuver node once it's no longer needed.
@@ -335,40 +441,137 @@ impl KspClient {
     }
 }
 
-/// Automatically stages when commanded thrust is lost for a sustained period.
+/// A bounded list of propulsion-stage activations allowed by the mission.
 ///
-/// Only call [`StagingMonitor::check`] while the script actually wants thrust
-/// (for example during a powered ascent or burn). It treats near-zero available
-/// thrust as "this stage is spent", which would misfire during an intentional
-/// coast with the throttle already at zero.
-pub struct StagingMonitor {
+/// Unlike a generic thrust-loss trigger, this plan checks engine state before
+/// staging, verifies that KSP predicts usable thrust for the next activation
+/// stage, and confirms that activation restores actual thrust. The activation
+/// count includes the initial launch stage.
+pub struct PropulsionStagePlan {
+    remaining_activations: u32,
     min_thrust_n: f32,
     confirm_duration: Duration,
+    ignition_timeout: Duration,
     thrust_loss_since: Option<Instant>,
+    observed_stage_cursor: Option<i32>,
+    manual_stage_change_observed: bool,
 }
 
-impl StagingMonitor {
-    /// `min_thrust_n` is the available-thrust threshold, in Newtons, below which
-    /// the current stage is considered spent. `confirm_duration` is how long that
-    /// condition must persist before staging, to avoid reacting to a brief engine
-    /// spool-up or a single noisy telemetry read.
-    pub fn new(min_thrust_n: f32, confirm_duration: Duration) -> Self {
+impl PropulsionStagePlan {
+    pub fn new(
+        propulsion_stage_count: u32,
+        min_thrust_n: f32,
+        confirm_duration: Duration,
+        ignition_timeout: Duration,
+    ) -> Self {
         Self {
+            remaining_activations: propulsion_stage_count,
             min_thrust_n,
             confirm_duration,
+            ignition_timeout,
             thrust_loss_since: None,
+            observed_stage_cursor: None,
+            manual_stage_change_observed: false,
         }
     }
 
-    /// Check the current available thrust and stage if it has been too low for
-    /// too long. Returns `true` if staging was triggered on this call.
-    pub fn check(
+    /// Activate one configured propulsion stage and wait for usable thrust.
+    pub fn activate_next(&mut self, ksp: &mut KspClient) -> Result<(), Box<dyn Error>> {
+        let (pending_stage, next_stage_max_thrust_n) = ksp.next_stage_max_thrust_n()?;
+        let next_stage_has_engine_capacity = stage_has_engine_capacity(
+            next_stage_max_thrust_n,
+            self.min_thrust_n,
+        );
+        match staging_decision(self.remaining_activations, next_stage_has_engine_capacity) {
+            StagingDecision::Activate => {}
+            StagingDecision::AbortNoConfiguredStage => {
+                ksp.set_throttle(0.0)?;
+                return Err("No configured propulsion stage remains; throttle cut before staging.".into());
+            }
+            StagingDecision::AbortNonPropulsiveStage => {
+                ksp.set_throttle(0.0)?;
+                return Err(format!(
+                    "Engines assigned to pending stage {pending_stage} have only {next_stage_max_thrust_n:.1} N of maximum thrust; throttle cut without staging."
+                )
+                .into());
+            }
+        }
+
+        // Stage with liquid-engine throttle closed so a new upper stage cannot
+        // inherit a burn command before mission code has rechecked attitude and
+        // acceleration. `available_thrust` still reports full-throttle capability.
+        ksp.set_throttle(0.0)?;
+        ksp.stage()?;
+        self.remaining_activations -= 1;
+        self.observed_stage_cursor = Some(ksp.current_stage()?);
+        self.manual_stage_change_observed = false;
+        let ignition_started = Instant::now();
+
+        while ignition_started.elapsed() < self.ignition_timeout {
+            if ksp.available_thrust_n()? >= self.min_thrust_n {
+                self.thrust_loss_since = None;
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        ksp.set_throttle(0.0)?;
+        Err("The configured propulsion stage did not produce usable thrust before the ignition timeout; throttle cut.".into())
+    }
+
+    /// Activate the next configured propulsion stage after a manual stage press.
+    ///
+    /// This is safe to call while orienting for a maneuver: it responds only to
+    /// an observed stage-cursor change followed by no active engines. It does
+    /// not perform ordinary spent-stage automation during a coast.
+    pub fn reconcile_manual_stage_transition(
         &mut self,
         ksp: &mut KspClient,
         available_thrust_n: f32,
     ) -> Result<bool, Box<dyn Error>> {
+        self.observe_stage_cursor(ksp)?;
+
+        if available_thrust_n >= self.min_thrust_n {
+            self.manual_stage_change_observed = false;
+            return Ok(false);
+        }
+
+        if self.manual_stage_change_observed
+            && ksp.active_propulsion_state(self.min_thrust_n)?
+                == ActivePropulsionState::NoActiveEngines
+        {
+            self.activate_next(ksp)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn observe_stage_cursor(&mut self, ksp: &mut KspClient) -> Result<(), Box<dyn Error>> {
+        let current_stage = ksp.current_stage()?;
+        if self
+            .observed_stage_cursor
+            .is_some_and(|previous_stage| previous_stage != current_stage)
+        {
+            self.manual_stage_change_observed = true;
+        }
+        self.observed_stage_cursor = Some(current_stage);
+
+        Ok(())
+    }
+
+    /// Stage only after active engine telemetry confirms sustained exhaustion.
+    /// Returns `true` when a configured propulsion stage was activated.
+    pub fn check_for_spent_stage(
+        &mut self,
+        ksp: &mut KspClient,
+        available_thrust_n: f32,
+    ) -> Result<bool, Box<dyn Error>> {
+        self.observe_stage_cursor(ksp)?;
+
         if available_thrust_n >= self.min_thrust_n {
             self.thrust_loss_since = None;
+            self.manual_stage_change_observed = false;
             return Ok(false);
         }
 
@@ -378,10 +581,177 @@ impl StagingMonitor {
             return Ok(false);
         }
 
-        ksp.stage()?;
+        let propulsion_state = ksp.active_propulsion_state(self.min_thrust_n)?;
+        match thrust_loss_staging_decision(
+            propulsion_state,
+            self.manual_stage_change_observed,
+        ) {
+            ThrustLossStagingDecision::ActivateNextPropulsionStage => {}
+            ThrustLossStagingDecision::AbortUnexpectedThrustLoss => {
+                self.thrust_loss_since = None;
+                ksp.set_throttle(0.0)?;
+                return Err("Sustained thrust loss was neither confirmed engine exhaustion nor a manual stage transition; throttle cut without staging.".into());
+            }
+        }
+
+        self.activate_next(ksp)?;
         self.thrust_loss_since = None;
 
         Ok(true)
+    }
+}
+
+/// Result of checking whether an automatic propulsion-stage activation is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingDecision {
+    Activate,
+    AbortNoConfiguredStage,
+    AbortNonPropulsiveStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePropulsionState {
+    Usable,
+    Spent,
+    NoActiveEngines,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrustLossStagingDecision {
+    ActivateNextPropulsionStage,
+    AbortUnexpectedThrustLoss,
+}
+
+pub fn thrust_loss_staging_decision(
+    propulsion_state: ActivePropulsionState,
+    manual_stage_change_observed: bool,
+) -> ThrustLossStagingDecision {
+    match propulsion_state {
+        ActivePropulsionState::Spent => {
+            ThrustLossStagingDecision::ActivateNextPropulsionStage
+        }
+        ActivePropulsionState::NoActiveEngines if manual_stage_change_observed => {
+            ThrustLossStagingDecision::ActivateNextPropulsionStage
+        }
+        ActivePropulsionState::Usable | ActivePropulsionState::NoActiveEngines => {
+            ThrustLossStagingDecision::AbortUnexpectedThrustLoss
+        }
+    }
+}
+
+pub fn stage_has_engine_capacity(stage_max_thrust_n: f32, min_thrust_n: f32) -> bool {
+    stage_max_thrust_n >= min_thrust_n
+}
+
+/// Convert KSP's internal stage cursor to the stage activated by the next press.
+pub fn pending_stage_number(current_stage: i32) -> Option<i32> {
+    current_stage.checked_sub(1).filter(|stage| *stage >= 0)
+}
+
+pub fn staging_decision(
+    remaining_activations: u32,
+    next_stage_has_engine_capacity: bool,
+) -> StagingDecision {
+    if remaining_activations == 0 {
+        StagingDecision::AbortNoConfiguredStage
+    } else if !next_stage_has_engine_capacity {
+        StagingDecision::AbortNonPropulsiveStage
+    } else {
+        StagingDecision::Activate
+    }
+}
+
+/// Why a maneuver burn should stop on the current control tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BurnCompletion {
+    InTolerance,
+    Overshot,
+}
+
+/// Classify maneuver progress using both scalar precision and signed prograde error.
+pub fn burn_completion(
+    remaining_delta_v_ms: f64,
+    remaining_prograde_ms: f64,
+    tolerance_ms: f64,
+) -> Option<BurnCompletion> {
+    if remaining_delta_v_ms <= tolerance_ms {
+        Some(BurnCompletion::InTolerance)
+    } else if remaining_prograde_ms <= 0.0 {
+        Some(BurnCompletion::Overshot)
+    } else {
+        None
+    }
+}
+
+/// Mission-level classification after the circularization node is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrbitOutcome {
+    Successful,
+    SafeButOffTarget,
+    Unsafe,
+}
+
+/// Classify altitudes measured above mean sea level, all in meters.
+pub fn classify_orbit(
+    apoapsis_altitude_m: f64,
+    periapsis_altitude_m: f64,
+    target_altitude_m: f64,
+    atmosphere_depth_m: f64,
+    safety_margin_m: f64,
+    target_tolerance_m: f64,
+) -> OrbitOutcome {
+    if periapsis_altitude_m <= atmosphere_depth_m + safety_margin_m {
+        return OrbitOutcome::Unsafe;
+    }
+
+    let apoapsis_on_target =
+        (apoapsis_altitude_m - target_altitude_m).abs() <= target_tolerance_m;
+    let periapsis_on_target =
+        (periapsis_altitude_m - target_altitude_m).abs() <= target_tolerance_m;
+
+    if apoapsis_on_target && periapsis_on_target {
+        OrbitOutcome::Successful
+    } else {
+        OrbitOutcome::SafeButOffTarget
+    }
+}
+
+/// Stateful max-Q limiter with hysteresis to avoid rapid throttle oscillation.
+#[derive(Debug, Default)]
+pub struct DynamicPressureLimiter {
+    limiting: bool,
+}
+
+impl DynamicPressureLimiter {
+    /// Return a throttle ceiling between 0 and 1 for the current pressure.
+    ///
+    /// Once pressure exceeds `max_dynamic_pressure_pa`, limiting remains active
+    /// until it falls below `release_ratio * max_dynamic_pressure_pa`. While
+    /// active, at least a 20% reduction is commanded; higher pressure tightens
+    /// the cap proportionally.
+    pub fn throttle_limit(
+        &mut self,
+        dynamic_pressure_pa: f32,
+        max_dynamic_pressure_pa: f32,
+        release_ratio: f32,
+    ) -> f32 {
+        if self.limiting {
+            if dynamic_pressure_pa < max_dynamic_pressure_pa * release_ratio {
+                self.limiting = false;
+            }
+        } else if dynamic_pressure_pa > max_dynamic_pressure_pa {
+            self.limiting = true;
+        }
+
+        if self.limiting {
+            (max_dynamic_pressure_pa / dynamic_pressure_pa.max(1.0)).clamp(0.1, 0.8)
+        } else {
+            1.0
+        }
+    }
+
+    pub fn is_limiting(&self) -> bool {
+        self.limiting
     }
 }
 
@@ -623,5 +993,80 @@ mod tests {
         // Burned mass = 500 * (1 - e^(-50 / (300 * g0))) ~= 8.43 kg.
         // Expected duration ~= 5.0 s.
         assert!((duration - 5.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn staging_requires_budget_and_a_propulsive_next_stage() {
+        assert_eq!(staging_decision(1, true), StagingDecision::Activate);
+        assert_eq!(
+            staging_decision(0, true),
+            StagingDecision::AbortNoConfiguredStage
+        );
+        assert_eq!(
+            staging_decision(1, false),
+            StagingDecision::AbortNonPropulsiveStage
+        );
+        assert!(!stage_has_engine_capacity(0.0, 1.0));
+        assert!(stage_has_engine_capacity(825_000.0, 1.0));
+        assert_eq!(pending_stage_number(4), Some(3));
+        assert_eq!(pending_stage_number(1), Some(0));
+        assert_eq!(pending_stage_number(0), None);
+    }
+
+    #[test]
+    fn manual_interstage_allows_next_propulsion_ignition() {
+        assert_eq!(
+            thrust_loss_staging_decision(ActivePropulsionState::NoActiveEngines, true),
+            ThrustLossStagingDecision::ActivateNextPropulsionStage
+        );
+        assert_eq!(
+            thrust_loss_staging_decision(ActivePropulsionState::NoActiveEngines, false),
+            ThrustLossStagingDecision::AbortUnexpectedThrustLoss
+        );
+        assert_eq!(
+            thrust_loss_staging_decision(ActivePropulsionState::Spent, false),
+            ThrustLossStagingDecision::ActivateNextPropulsionStage
+        );
+    }
+
+    #[test]
+    fn burn_completion_detects_tolerance_and_signed_overshoot() {
+        assert_eq!(
+            burn_completion(0.4, 0.4, 0.5),
+            Some(BurnCompletion::InTolerance)
+        );
+        assert_eq!(
+            burn_completion(1.2, -0.1, 0.5),
+            Some(BurnCompletion::Overshot)
+        );
+        assert_eq!(burn_completion(1.2, 1.0, 0.5), None);
+    }
+
+    #[test]
+    fn orbit_classification_distinguishes_target_safe_and_unsafe() {
+        assert_eq!(
+            classify_orbit(80_000.0, 79_000.0, 80_000.0, 70_000.0, 5_000.0, 2_000.0),
+            OrbitOutcome::Successful
+        );
+        assert_eq!(
+            classify_orbit(90_000.0, 78_000.0, 80_000.0, 70_000.0, 5_000.0, 2_000.0),
+            OrbitOutcome::SafeButOffTarget
+        );
+        assert_eq!(
+            classify_orbit(80_000.0, 74_000.0, 80_000.0, 70_000.0, 5_000.0, 2_000.0),
+            OrbitOutcome::Unsafe
+        );
+    }
+
+    #[test]
+    fn dynamic_pressure_limiter_uses_hysteresis() {
+        let mut limiter = DynamicPressureLimiter::default();
+
+        assert_eq!(limiter.throttle_limit(24_000.0, 25_000.0, 0.9), 1.0);
+        assert!(limiter.throttle_limit(26_000.0, 25_000.0, 0.9) <= 0.8);
+        assert!(limiter.is_limiting());
+        assert!(limiter.throttle_limit(23_000.0, 25_000.0, 0.9) <= 0.8);
+        assert_eq!(limiter.throttle_limit(22_000.0, 25_000.0, 0.9), 1.0);
+        assert!(!limiter.is_limiting());
     }
 }

@@ -13,6 +13,7 @@ This is a learning project. Its programs will cover activities such as launches,
 
 - `src/lib.rs`: the `KspClient` library, where low-level kRPC calls are turned into focused rocket operations.
 - `src/bin/vessel_info.rs`: a runnable connection test that prints basic data for KSP's active vessel.
+- `src/bin/launch.rs`: a conservative launch-to-orbit controller with explicit propulsion staging, max-Q and acceleration limits, maneuver alignment checks, and orbit validation.
 - `services/`: compatible `KRPC.*.json` API descriptions copied from the installed kRPC mod, including SpaceCenter, UI, Drawing, and installed mod integrations.
 - `build.rs`: generates Rust bindings from the service descriptions during every relevant Cargo build.
 - `docs/`: generated per-service API references and focused Rust/kRPC guides for contributors and agents.
@@ -58,6 +59,54 @@ Run the checks with:
 ```powershell
 cargo test
 ```
+
+Run the known-good Kerbin launch profile with:
+
+```powershell
+cargo run --bin launch -- --propulsion-stage-count 2 --target-apoapsis-km 80
+```
+
+`--propulsion-stage-count` includes the initial engine-ignition stage. The
+launcher requires nonzero maximum thrust from engines assigned to KSP's pending
+UI stage, waits up to `--stage-ignition-timeout-s` for actual usable thrust, and never advances
+past the configured count. Match this value to the vessel's staging stack
+before launch; the default assumes a conventional two-stage rocket.
+
+kRPC exposes KSP's internal stage cursor, which is one greater than the stage
+activated by the next Space press. The launcher converts that cursor before
+matching engine-part stage numbers; for example, internal stage 4 activates the
+stage labeled 3 in the flight UI.
+
+Crafts may include a manually controlled non-propulsive interstage between two
+configured propulsion stages. If the player activates that interstage while
+the launcher is orienting for or executing the maneuver, the controller notices
+the stage-cursor change, verifies that the active vessel has no active engine,
+then activates and verifies the next configured propulsion stage at closed
+throttle. A throttle loss without either exhausted engines or an observed manual
+stage transition still aborts without pressing Space.
+
+For the documented `Small sat` layout, `--propulsion-stage-count 2` counts
+stage 3 (launch propulsion) and stage 1 (orbital propulsion). Press Space once
+for stage 2 when separation is desired; do not also activate stage 1 manually.
+Stage 0 remains outside the configured propulsion budget, protecting the
+fairing and satellite deployment sequence from automatic staging.
+
+The default profile launches east at 90 degrees, limits acceleration to 3 g,
+and limits Kerbin dynamic pressure to 25,000 Pa with hysteresis. It requires the
+target altitude to clear the current body's atmosphere plus the configured
+safety margin. Airless bodies skip dynamic-pressure control, but their pitch
+schedule and other defaults still need craft-specific testing. Before a maneuver
+burn, it also reserves 20 seconds in real time for kRPC autopilot alignment;
+raise `--maneuver-orientation-reserve-s` for a slow-turning craft. Use
+`cargo run --bin launch -- --help` for all profile, alignment, orbit-tolerance,
+and throttle settings.
+
+At the end of a run, the launcher reports one of three results: an approximately
+circular target orbit, a safe but off-target orbit, or an unsafe/suborbital
+trajectory. Unsafe results return an error. Cargo tests cover pure controller
+decisions, but launches must still be tested in a disposable save because no
+unit test can establish a vessel's control authority, staging layout, or
+structural margin.
 
 Cargo is Rust's equivalent of npm plus its build/test runner: it downloads dependencies, runs `build.rs` to generate the bindings, compiles the crate, and runs the requested command. The first build may take longer while Cargo downloads and compiles the two `krpc-mars` Git dependencies.
 
